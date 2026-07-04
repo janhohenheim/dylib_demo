@@ -1,4 +1,10 @@
 use std::fmt::Display;
+
+#[repr(C)]
+pub struct Plugin {
+    pub entrypoint: EntrypointFn,
+}
+
 // rmeta fixes our ABI stability issues for structs, but not for calling conventions,
 // so functions going across the ABI boundary must be marked as unsafe extern "C".
 pub type EntrypointFn = unsafe extern "C" fn(&mut Person);

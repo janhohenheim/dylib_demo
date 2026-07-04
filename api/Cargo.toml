@@ -1,6 +1,9 @@
 [package]
-name = "common"
+name = "api"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+crate-type = ["rlib", "dylib"]
 
 [dependencies]

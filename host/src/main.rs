@@ -1,4 +1,4 @@
-use common::*;
+use api::*;
 use libloading::{Library, Symbol};
 
 fn main() {
@@ -9,9 +9,7 @@ fn main() {
 
     unsafe {
         let lib = Library::new("target/debug/libplugin.so").expect("failed to find libplugin.so");
-        let entrypoint: Symbol<EntrypointFn> = lib
-            .get(b"ENTRYPOINT")
-            .expect("No ENTRYPOINT symbol exported");
-        entrypoint(&mut person);
+        let plugin: Symbol<&Plugin> = lib.get(b"PLUGIN").expect("No PLUGIN symbol exported");
+        (plugin.entrypoint)(&mut person);
     }
 }
