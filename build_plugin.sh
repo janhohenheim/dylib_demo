@@ -7,7 +7,7 @@ set -euo pipefail
 # Note that all the deps used by `api` in `target/debug/deps` *also* need to be distributed.
 rustc +nightly \
     --edition 2024 \
-    --crate-type=dylib \
+    --crate-type=cdylib \
     --crate-name=plugin \
     --extern api="target/debug/libapi.rlib" \
     -L dependency=target/debug/deps \
