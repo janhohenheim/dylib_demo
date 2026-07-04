@@ -4,7 +4,7 @@ cargo +nightly rustc -p host -- \
   -C prefer-dynamic \
   -C link-args=-Wl,-rpath,'$ORIGIN/'
 
-API_RLIB=$(ls target/debug/deps/libapi-*.rlib | head -n1)
+API_RLIB=$(ls target/debug/deps/libapi.rlib | head -n1)
 
  rustc +nightly \
   --edition 2024 \
