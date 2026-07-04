@@ -1,4 +1,8 @@
-//! Vendored from <https://github.com/WilliamVenner/prefer-dynamic/>, but allowing symlinked `target/`
+//! Vendored from <https://github.com/WilliamVenner/prefer-dynamic/>,
+//! but adapted to allow the use of symlinked `target/`
+//! This is only here to automatically copy-paste the standard library's `.so` into our `OUT_DIR`.
+//! We could also set `DYLD_LIBRARY_PATH` to point to the output of `rustc --print=target-libdir` instead.
+//! Anyways, this is all boring boilerplate, ignore this file :)
 use std::env::{var, var_os};
 use std::ffi::OsStr;
 use std::fmt;

@@ -1,10 +1,11 @@
 [workspace]
-members = ["host", "api","plugin"]
+members = ["host", "api", "plugin"]
 #exclude = ["../plugin"]
 resolver = "3"
 
 [workspace.dependencies]
 libloading = "0.9"
+rootcause = "0.13"
 host = { version = "0.1", path = "host" }
 api = { version = "0.1", path = "api" }
 plugin = { version = "0.1", path = "plugin" }

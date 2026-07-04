@@ -1,15 +1,46 @@
-use api::*;
+use std::env::current_exe;
+
+use api::{
+    rootcause::{option_ext::OptionExt as _, prelude::ResultExt},
+    *,
+};
 use libloading::{Library, Symbol};
 
-fn main() {
-    let mut person = Person {
-        name: "hello".into(),
-        age: 42,
-    };
+fn main() -> Result {
+    let mut app = App::new();
+
+    // Here we read the single plugin from the same dir as the host executable,
+    // but we could also load multiple plugins from a dedicated `plugins` directory.
+    let exe_dir = current_exe()
+        .context("failed to get current exe path")?
+        .parent()
+        .context("exe has no parent dir")?
+        .to_path_buf();
+    let plugin_path = exe_dir.join("libplugin.so");
 
     unsafe {
-        let lib = Library::new("target/debug/libplugin.so").expect("failed to find libplugin.so");
-        let plugin: Symbol<&Plugin> = lib.get(b"PLUGIN").expect("No PLUGIN symbol exported");
-        (plugin.entrypoint)(&mut person);
+        let lib = Library::new(&plugin_path).context("failed to find libplugin.so")?;
+        // First: validate that the plugin is API-compatible
+        {
+            let plugin: Symbol<&Plugin> = lib
+                .get(PLUGIN_SYMBOL)
+                .context("No PLUGIN symbol exported")?;
+            let api_version = plugin.api_version();
+            if api_version != api::API_VERSION {
+                rootcause::bail!(
+                    "API version mismatch: expected {}, got {}",
+                    api::API_VERSION,
+                    api_version
+                );
+            }
+        }
+        // Okay, it's compatile! Now let's leak it and then load the plugin from the leaked ref.
+        // Why leak? well TL;DR unloading a dylib is really really hard to do right, and honestly not really worth it.
+        let lib: &'static mut Library = Box::leak(Box::new(lib));
+
+        // *Now* we can properly use the plugin.
+        let plugin: Symbol<&Plugin> = lib.get(PLUGIN_SYMBOL).unwrap();
+        (plugin.entrypoint)(&mut app)?;
+        Ok(())
     }
 }

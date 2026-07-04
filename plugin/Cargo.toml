@@ -1,7 +1,12 @@
+# FAKE FAKE FAKE
+# See the explanation in lib.rs
+
 [package]
 name = "plugin"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# this is completely ignored, do NOT add anything here
+# the `api` dep is only specified here for rust-analyzer's sake.
 api.workspace = true
