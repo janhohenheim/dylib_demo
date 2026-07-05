@@ -12,9 +12,9 @@ RUSTFLAGS="\
 -C prefer-dynamic \
 -C rpath" \
 rustc \
+    --crate-name=plugin \
     --edition 2024 \
     --crate-type=dylib \
-    --crate-name=plugin \
     --extern api="target/debug/deps/libapi.so" \
     -L dependency="target/debug/deps" \
     -o target/debug/libplugin.so \

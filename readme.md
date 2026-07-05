@@ -66,11 +66,16 @@ can change their memory layout overnight. The compiler is allowed to reshuffle t
 and can freely break the ABI in the process.
 
 That means that Rust has excellent freedom in how to improve their internals, but comes with the cost of dynamic linking no longer being straightforward. 
-The go-to solution is to use `repr(C)`.
+
+> Foreshadowing: There is one situation where this is fine: dynamic linking is guaranteed to have compatible ABI
+> across all crates that were compiled within the same compiler invocation, 
+> e.g. by a single `cargo build` command.
+
+The go-to solution for the problem of an unstable ABI is to force a stable once by using `repr(C)`.
 
 ## `repr(C)` and why it sucks
 
-The above ABI convention is called `repr(Rust)`, and you probably have never seen that written out anywhere because it's the implicit default.
+The unstable ABI convention is called `repr(Rust)`, and you probably have never seen that written out anywhere because it's the implicit default.
 As an alternative, `#[repr(C)]` is an annotation you can use on data types to say "dear Rust compiler, please keep this type's ABI stable"
 It's called like that because it geeeenerally uses the C ABI, which is a very widely used standard supported by most modern programming languages.
 If you want your code to be able to be compatible with other languages, `repr(C)` is your friend.
@@ -153,13 +158,143 @@ no.
 First up: I didn't invent this. [bjorn3](https://github.com/bjorn3) and [jyn](https://github.com/jyn514) taught me this trick. 
 But I couldn't find any good public writeups about it (please send them my way!), so I decided to vomit out this stream of consciousness at 2 am.
 Anyways, let's get to the heart of it.
+The crate structure we want is:
+- `host`: something that loads and runs plugins
+- `plugin`: a dynamic library
+- `api`: a crate that defines the API and is used by both the host and the plugin
+
+Since `api` should be the exact same for both the host and the plugin, it makes sense to also make it a shared library.
 
 Our core issue is that we *know* that we only care about Rust <-> Rust interop and don't care about what C may or may not like. 
 All we need is a way for the host and the plugin to share on how the API looks, even if it unstable.
 The solution is to share build artifacts.
 
 While a dev is not allowed to peek inside the ABI definition, `rustc` (the Rust compiler used by `cargo`) certainly creates and in turn uses that information.
-Good news: that data is not thrown away, but actually stored on disk as part of the build artifacts. 
-It usually comes in the form of an `libmy_cool_crate.rmeta` file, or ([rmeta](https://rustc-dev-guide.rust-lang.org/backend/libs-and-metadata.html#metadata)) for short.
+Good news: that data is not thrown away, but actually stored on disk as part of the build artifacts under `target/debug/deps`. 
+It usually comes in the form of a `libmy_cool_crate.rmeta` file, or ([rmeta](https://rustc-dev-guide.rust-lang.org/backend/libs-and-metadata.html#metadata)) for short.
 
-Extra good news: dynamic libraries even have that information embedded in them!
+If we create and compile a `dylib` for `api`, we will not find any `rmeta` for it. Don't worry though, it's there, embedded in the dynamic library itself!
+
+Per the schema above, `host` depends on `api`. As mentioned a while ago, dynamic linking is guaranteed to have compatible ABI across all crates that were compiled within the same compiler invocation. 
+So, if `host` depends on `api`, and we build `host` with a `cargo build`, that will in turn build `api` in the same compiler invocation, making `host` and `api` ABI compatible.
+
+Now if a dev wants to create a plugin for a `host` they downloaded, using the `api` crate, the first instinct
+would be to add `api` to their `Cargo.toml` under `[dependencies]`:
+
+```toml
+[dependencies]
+my_cool_api = "1.0.0"
+```
+
+That is precisely where the trouble begins, since that would no longer be the same compiler invocation we used for `host` and `api`. 
+BUT! Remember when we said before that our dynamic library contains within it an `rmeta` file with all the ABI information needed? 
+The trick now is to not let a plugin dev build their own `api`, but give them our pre-built `libapi.so` (along with some extra build information we'll get to later), 
+and let them link against that not at runtime, but at build time.
+
+Since that will read the exact same `rmeta` that was used to build `host`, `plugin` and `host` will both agree on how all types in `api` look like.
+
+There's a few details to keep in mind when doing that, and we'll look at them in the next section. But this is the core idea:
+By distributing `api`'s `rmeta`, which is embedded in the `dylib` itself, `plugin` can use that information
+at build time to ensure ABI compatibility with `host`, even if all types involved are `repr(Rust)`.
+
+
+## The nitty-gritty
+
+Let's start with the build instructions needed for all of this, then chew through them.
+
+This is the build command for the `host` + `api`:
+
+```sh
+RUSTFLAGS="\
+-C prefer-dynamic \
+-C rpath" \
+cargo build -p host
+```
+
+Remember that `host` depends on `api`, so the above builds both, implicitly. The only thing of note here are the rustflags.
+These let all crates touched by this compiler invocation link against the standard library dynamically.
+The reason we do this is because the standard library uses internal global state, so if you have multiple statically linked
+copies of the standard library, they will disagree about the state of the world, since they all have their own
+view of the world, which may be ABI incompatible between them. [That will blow up](https://github.com/rust-lang/rust/issues/131468#issuecomment-2405285332), so we dynamically link them all against the same standard library dynamic library.
+
+Now let's get to the true magicc.
+This here is where `plugin` is built by referencing the existing `libapi.so`:
+
+```sh
+RUSTFLAGS="\
+-C prefer-dynamic \
+-C rpath" \
+rustc \
+    --crate-name=plugin \
+    --edition 2024 \
+    --crate-type=dylib \
+    --extern api="lib/libapi.so" \
+    -L dependency="lib/deps" \
+    -o lib/libplugin.so \
+    plugin/src/lib.rs
+```
+
+unfortunately, this functionality is not (yet) exposed in `cargo`, so we need to go one level deeper and manually build the `plugin` with `rustc`.
+Let's take a look at some select lines of the above command:
+```sh
+RUSTFLAGS="\
+-C prefer-dynamic \
+-C rpath" \
+```
+same as before, we link against the standard library dynamically.
+
+```sh
+--crate-type=dylib
+```
+we compile our `plugin` as a `dylib`. Rust can build two flavors of dynamic libraries: `dylib` and `cdylib`.
+`cdylib` is where we use C conventions everywhere (roughly, there's again a ton of nuance), 
+but since we only care about Rust <-> Rust interop and have already found a way to get ABI compatibility, we use `dylib`, which is a regular Rust dynamic library.
+
+```sh
+--extern api="lib/libapi.so" \
+```
+we fetch the `libapi.so` from the `lib` directory to use it in our build. We assume that this is run on the machine
+of a plugin author that has received this `lib` directory from us in advance.
+```sh
+-L dependency="lib/deps" \
+ ```
+`api` itself can also bring in its own dependencies that it compiled statically into itself. If you want to be 
+ABI compatible with `api`, you also need to be `ABI` compatible with its dependencies. By also distributing the 
+build artifacts of the dependencies, we can ensure that.
+
+```sh
+-o lib/libplugin.so \
+```
+
+emit the `plugin` as a `libplugin.so` file in the `lib` directory.
+
+```sh
+plugin/src/lib.rs
+```
+use `plugin/src/lib.rs` as the entry point for our `plugin`'s code. If you've ever used a c or c++ compiler, you may think that 
+you need to list every `.rs` file you have in your project, but this is actually smarter. `rustc` will
+automatically follow any `mod` declarations recursively to find all necessary `.rs` files to compile your `plugin`.
+
+TODO:
+- panic unwind in plugin
+  - don't panic in api
+- API version check
+- entrypoint needs to be `repr(C)`
+- `#[unsafe(no_mangle)]`
+- this works when distributing release
+- this works when using different rustflags (with a few rare exceptions)
+
+## Caveats
+
+TODO:
+- get libstd.so into the right dir
+- leak libloading instead of dropping
+- generics
+- rustflags overrides
+- allocator
+- platform
+- panic strategy
+- target-feature / simd
+- `soft-float` calling convention
+- `target-feature=+crt-static` forces static
+- `-Z randomize-layout / -Z layout-seed` lol
