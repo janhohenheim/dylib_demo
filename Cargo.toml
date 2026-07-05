@@ -1,6 +1,6 @@
 [workspace]
 members = ["host", "api", "plugin"]
-#exclude = ["../plugin"]
+exclude = ["host", "api", "plugin"]
 resolver = "3"
 
 [workspace.dependencies]
