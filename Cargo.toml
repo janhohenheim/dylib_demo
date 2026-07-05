@@ -1,5 +1,7 @@
 [workspace]
 members = ["host", "api", "plugin"]
+# excluding everything so that rust-analyzer doesn't do its own building,
+# bypassing the very specific build instructions we need
 exclude = ["host", "api", "plugin"]
 resolver = "3"
 

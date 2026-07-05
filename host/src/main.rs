@@ -22,10 +22,12 @@ fn main() -> Result {
         let lib = Library::new(&plugin_path).context("failed to find libplugin.so")?;
         // First: validate that the plugin is API-compatible
         {
-            let plugin: Symbol<&Plugin> = lib
+            // Only load the `PluginHeader`, which is guaranteed to be
+            // the first field inside `Plugin`s across all versions of `api`.
+            let header: Symbol<&PluginHeader> = lib
                 .get(PLUGIN_SYMBOL)
                 .context("No PLUGIN symbol exported")?;
-            let api_version = plugin.api_version();
+            let api_version = header.api_version();
             if api_version != api::API_VERSION {
                 rootcause::bail!(
                     "API version mismatch: expected {}, got {}",

@@ -283,10 +283,12 @@ TODO:
 - `#[unsafe(no_mangle)]`
 - this works when distributing release
 - this works when using different rustflags (with a few rare exceptions)
+- `rust-toolchain.toml`
 
 ## Caveats
 
 TODO:
+- maybe r-a overrides stuff
 - get libstd.so into the right dir
 - leak libloading instead of dropping
 - generics

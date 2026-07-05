@@ -17,25 +17,49 @@ pub type Result<T = ()> = rootcause::Result<T>;
 /// so functions going across the ABI boundary must be marked as unsafe extern "C".
 /// `App` is a pointer to signify that this is not really an actual Rust reference,
 /// but a magic pointer coming from a host process.
-pub type EntrypointFn = extern "C" fn(*mut App) -> Result<()>;
+///
+/// This is allowed to be `extern "Rust"` because the calling convention is stable for a given ABI.
+/// Since the ABI is compatible between all `api` consumers, this calling convention is also compatible.
+pub type EntrypointFn = fn(*mut App) -> Result<()>;
 
 /// The symbol that the plugin exposes and the host reads.
+/// This is the only bit we keep at `repr(C)` so that `PluginHeader`
+/// can be read even if the host and plugin use different versions of the `api` crate.
+/// Since `PluginHeader` is `repr(C)` and guaranteed to be the first field of `Plugin`,
+/// the host can always safely do a compatibility check before reading the entire `Plugin` struct.
 #[repr(C)]
 pub struct Plugin {
-    /// Forbid the user from accidentally modifying the API version by making it private.
-    api_version: u32,
+    /// Forbid the user from accidentally modifying the header by making it private.
+    /// Always keep this as the first field.
+    header: PluginHeader,
     pub entrypoint: EntrypointFn,
+}
+
+/// This struct is fixed in stone and must never change across API versions.
+#[repr(C)]
+pub struct PluginHeader {
+    api_version: u32,
 }
 
 impl Plugin {
     pub const fn new(entrypoint: EntrypointFn) -> Self {
         Self {
-            api_version: API_VERSION,
+            header: PluginHeader {
+                api_version: API_VERSION,
+            },
             entrypoint,
         }
     }
 
-    pub const fn api_version(&self) -> u32 {
+    pub const fn header(&self) -> &PluginHeader {
+        &self.header
+    }
+}
+
+impl PluginHeader {
+    /// The `extern "C"` is not strictly required here I think,
+    /// but let's be safe
+    pub const extern "C" fn api_version(&self) -> u32 {
         self.api_version
     }
 }
