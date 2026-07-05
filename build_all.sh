@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-./build_api.sh
+cargo clean
+
 ./build_host.sh
 ./build_plugin.sh
 

@@ -1,15 +1,15 @@
-# `rlib`-based Dynamic Library Plugin System for Rust Demo
+# `rmeta`-based Dynamic Library Plugin System for Rust Demo
 
-AKA `rlib` API.
+AKA `rmeta` API.
 
 This is a showcase of a somewhat obscure way to do plugin systems in Rust using dynamic libraries.
 It consists of 
 - `host`: The main application that loads and uses the plugins. Assume that this is distributed to users.
-- `plugin`: A plugin that is loaded and run by the host. Assume that this is made by users or plugin developers.
-- `api`: Shared API used by the host and all plugins. Assume that this is distributed to plugin authors.
+- `plugin`: A `dylib` plugin that is loaded and run by the host. Assume that this is made by users or plugin developers.
+- `api`: A `dylib` containing the `repr(Rust)` API used by the host and all plugins. Assume that this is distributed to plugin authors.
 
-TL;DR for the technique: we build `api` as an `rlib`. We use that `rlib` to build the `host`, then ship
-it to plugin authors so that they can link against it when building their plugins.
+TL;DR for the technique: we distribute `libapi.so` (including the `.rmeta` inside) and its build-time deps to plugin authors. 
+Plugins are linked against `api`, but don't build it themselves. Instead, they use the build artifacts provided by the host to ensure ABI compatibility.
 
 Now for the long story, strap in.
 
@@ -148,7 +148,7 @@ Be kind to the Rust folk, don't depend on unstable ABI.
 
 no.
 
-## A Proposed Solution: `rlib` API
+## A Proposed Solution: `rmeta` API
 
 First up: I didn't invent this. [bjorn3](https://github.com/bjorn3) and [jyn](https://github.com/jyn514) taught me this trick. 
 But I couldn't find any good public writeups about it (please send them my way!), so I decided to vomit out this stream of consciousness at 2 am.
@@ -158,4 +158,8 @@ Our core issue is that we *know* that we only care about Rust <-> Rust interop a
 All we need is a way for the host and the plugin to share on how the API looks, even if it unstable.
 The solution is to share build artifacts.
 
-When you build
+While a dev is not allowed to peek inside the ABI definition, `rustc` (the Rust compiler used by `cargo`) certainly creates and in turn uses that information.
+Good news: that data is not thrown away, but actually stored on disk as part of the build artifacts. 
+It usually comes in the form of an `libmy_cool_crate.rmeta` file, or ([rmeta](https://rustc-dev-guide.rust-lang.org/backend/libs-and-metadata.html#metadata)) for short.
+
+Extra good news: dynamic libraries even have that information embedded in them!
