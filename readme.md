@@ -1,4 +1,4 @@
-# `rmeta`-based Dynamic Library Plugin System for Rust Demo
+# `rmeta`-Based Dynamic Library Plugin System
 
 AKA `rmeta` API.
 
