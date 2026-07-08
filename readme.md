@@ -1,6 +1,6 @@
 # `rmeta`-Based Dynamic Library Plugin System
 
-AKA `rmeta` API.
+AKA the `rmeta` trick.
 
 This is a showcase of a somewhat obscure way to do plugin systems in Rust using dynamic libraries.
 It consists of 
@@ -153,7 +153,7 @@ Be kind to the Rust folk, don't depend on unstable ABI.
 
 no.
 
-## A Proposed Solution: `rmeta` API
+## A Proposed Solution: The `rmeta` trick
 
 First up: I didn't invent this. [bjorn3](https://github.com/bjorn3) and [jyn](https://github.com/jyn514) taught me this trick. 
 But I couldn't find any good public writeups about it (please send them my way!), so I decided to vomit out this stream of consciousness at 2 am.
@@ -196,7 +196,6 @@ Since that will read the exact same `rmeta` that was used to build `host`, `plug
 There's a few details to keep in mind when doing that, and we'll look at them in the next section. But this is the core idea:
 By distributing `api`'s `rmeta`, which is embedded in the `dylib` itself, `plugin` can use that information
 at build time to ensure ABI compatibility with `host`, even if all types involved are `repr(Rust)`.
-
 
 ## The nitty-gritty
 
@@ -271,9 +270,105 @@ emit the `plugin` as a `libplugin.so` file in the `lib` directory.
 ```sh
 plugin/src/lib.rs
 ```
-use `plugin/src/lib.rs` as the entry point for our `plugin`'s code. If you've ever used a c or c++ compiler, you may think that 
+use `plugin/src/lib.rs` as the entry point for our `plugin`'s code. If you've ever used a C or C++ compiler, you may think that 
 you need to list every `.rs` file you have in your project, but this is actually smarter. `rustc` will
 automatically follow any `mod` declarations recursively to find all necessary `.rs` files to compile your `plugin`.
+
+If you think this all sounds like quite a bit of work for a regular user, I've got good news. 
+You can tell cargo to replace all calls to `rustc` with a custom command by setting the `RUSTC_WRAPPER` env var.
+This way, you can change internal calls to `--extern api=...` to point to our `.so`, as well as add all other magic incantations needed.
+The user's call then becomes a trivial `RUSTC_WRAPPER="my_cool_wrapper" cargo build`. 
+The code for doing this is left as an exercise to the reader ;)
+
+## Determinism as a consequence
+
+As hinted at before, there's one more thing to dynamic linking interop than types: calling conventions.
+These are the way that parameters and return values are laid out in memory: most notably which registers they are placed in and how the stack is managed. 
+In this aspect too, Rust is unstable by design.
+
+Just like all structs in Rust are `repr(C)` by default, all functions have a similar implicit annotation: `extern "Rust"`. 
+If we want to nail down the C calling convention, we can use `extern "C"` instead:
+```rust
+extern "C" fn some_function(arg1: i32, arg2: i32) -> i32 {
+    arg1 + arg2
+}
+```
+
+Using `extern "C"` requires only using `repr(C)` types everywhere, or the compiler will yell at you:
+
+```rust
+extern "C" fn append(string: String, to_append: &str) -> String {
+    string + &to_append
+}
+```
+triggers:
+```
+extern fn uses type String, which is not FFI-safe
+consider adding a #[repr(C)] or #[repr(transparent)] attribute to this struct
+this struct has unspecified layout
+#[warn(improper_ctypes_definitions)] on by default (rustc improper_ctypes_definitions)
+```
+This is a lovely lint that is enabled by default, and is much more helpful than the laissez-faire attitude of `repr(C)` in many cases.
+
+So, does that mean that we still need to annotate all of our types with `extern "C"`? Nope!
+Remember, we don't actually care about any C calling conventions since we are doing Rust <-> Rust communication.
+But what about the fact that `extern "Rust"` is unstable? Well, turns out that is simply a direct consequence of the fact that `repr(Rust)` is unstable.
+As soon as we use the `rmeta` trick to make our types stable, `extern "Rust"` functions operating on them are
+stable as well. In other words: no annotations needed for our functions!
+
+For very similar reasons, generics are not a problem either. 
+Generic monomorphization (aka what happens when you fill in a concrete type for a generic parameter) is 
+only unstable as a consequence of `repr(Rust)` being unstable, so using this trick makes all generics stable too,
+as long as the specific types used were re-exported by the `api` crate.
+
+It's worth pointing out that this does not mean that we are limited to only using `api`-exported types at all.
+If `api` exports a `Query<T>` struct, and `plugin` has an internal struct `Player` so that it can use `Query<&Player>`, that is fine, since `Player` never crosses any FFI boundaries.
+
+## Caution when setting RUSTFLAGS
+
+There's a very annoying fact you should be aware of when setting `RUSTFLAGS`.
+Devs can specify which `RUSTFLAGS` to use in many different places. 
+The environment variable we already discussed, can be set on the user's environment in general, e.g. in their shell config. 
+If you then go ahead and use `RUSTFLAGS="..." cargo build`, you will override the environment variable.
+Users can also use a `myproject/.cargo/config.toml` file to set `RUSTFLAGS` for their project. Or,
+they can use a global `~/.cargo/config.toml` file to set `RUSTFLAGS` for all their projects.
+All of these sources of `RUSTFLAGS` will NOT be merged. They will happily completely override each other.
+So, if you want to be friendly to users that already have `RUSTFLAGS` in place, e.g. to speed up their builds,
+you should never just override them anywhere. Instead, the correct (and very annoying approach) is to
+write some CLI tool that goes and reads all `RUSTFLAGS` already in place by checking the sources I mentioned above,
+and then adds our own `RUSTFLAGS` on top before passing it along to `cargo build`.
+In fact, it gets even more annoying. There's more sources than what I mentionned, and depending on where they are
+defined, they will actually be merged with specific others. 
+
+There's some hacks that can be used to make working around this easier. See
+[rust-lang/cargo#5376](https://github.com/rust-lang/cargo/issues/5376) for more details.
+
+## Mixing RUSTFLAGS
+
+Assume you have done the work and nicely merged user's `RUSTFLAGS` with our own. Is that dangerous?
+After all, `host` + `api` and `plugin` are now compiled with different `RUSTFLAGS`.
+
+Well, there's not clear cut answer here. Fortunately, this will almost always be fine, since almost no `RUSTFLAG`
+affects type layouts. There are some exceptions however. Treat the following as a non-exhaustive list, since I bet
+there are some I don't know about:
+- `-Z randomize-layout / -Z layout-seed`: This randomizes type layouts on builds, breaking all of our assumptions.
+  While this doesn't come up in regular builds, there are some that like to run `miri` checks with this option enabled.
+- `-C target-feature=-crt-static`: forces static linking.
+- `-C soft-float`: changing the calling conventions of all things touching floating point numbers to use software instead of hardware implementations.
+  This comes up often when building for targets such as embedded where there may be no hardware floating point support.
+  If you want to support plugins for such targets, you will need to also ship `api`/`host` with `-C soft-float` enabled.
+- `-C panic`: changes the panic strategy. For the standard library, the default is `unwind`, but you can set it to `abort` to make panics non-recoverable.
+  If you build for `no_std`, you will need to specify your own panic handler.
+  Regardless, `api`/`host` and `plugin` need to agree on the panic strategy used.
+
+## Some words on plugin systems in general
+
+Now that we know how the `rmeta` trick works and what to watch out for, let's dive into some more general
+considerations when building plugin systems. Most of this is not specific to the `rmeta` trick, but important to
+know when you want to actually make use of it.
+
+
+
 
 TODO:
 - panic unwind in plugin
@@ -291,12 +386,6 @@ TODO:
 - maybe r-a overrides stuff
 - get libstd.so into the right dir
 - leak libloading instead of dropping
-- generics
-- rustflags overrides
 - allocator
 - platform
-- panic strategy
 - target-feature / simd
-- `soft-float` calling convention
-- `target-feature=+crt-static` forces static
-- `-Z randomize-layout / -Z layout-seed` lol
