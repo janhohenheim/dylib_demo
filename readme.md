@@ -349,8 +349,13 @@ Assume you have done the work and nicely merged user's `RUSTFLAGS` with our own.
 After all, `host` + `api` and `plugin` are now compiled with different `RUSTFLAGS`.
 
 Well, there's not clear cut answer here. Fortunately, this will almost always be fine, since almost no `RUSTFLAG`
-affects type layouts. There are some exceptions however. Treat the following as a non-exhaustive list, since I bet
-there are some I don't know about:
+affects type layouts. 
+The same is true for `dev` vs `release` builds. These are compatible, so you can ship `release` builds of `api` and `host` to your users, 
+compiled with the most expensive, most optimized settings possible.
+That means that users downloading your dynamic libraries get full performance for no compilation cost at all. Yay!
+
+Back to RUSTFLAGS, there are some exceptions we should mention as being incompatible with `api`/`host` builds that are not aware of them.
+Treat the following as a non-exhaustive list, since I bet there are some I don't know about:
 - `-Z randomize-layout / -Z layout-seed`: This randomizes type layouts on builds, breaking all of our assumptions.
   While this doesn't come up in regular builds, there are some that like to run `miri` checks with this option enabled.
 - `-C target-feature=-crt-static`: forces static linking.
@@ -367,25 +372,222 @@ Now that we know how the `rmeta` trick works and what to watch out for, let's di
 considerations when building plugin systems. Most of this is not specific to the `rmeta` trick, but important to
 know when you want to actually make use of it.
 
+### Versioning
+
+First up, let's show the minimal stuff that `api` needs to include. Let's say that all of our plugins have an entrypoint function that the host can call:
+```rust
+pub fn entrypoint() {
+    // this method is called when the plugin is loaded
+}
+```
+While a real-life plugin would probably want some parameter and / or return value, let's keep it simple for now.
+How does the host call this function? Basically, it loads the dynamic library and searches for a well-known
+*symbol* that the plugin exports. This is basically looking through the dynamic library for a magic string.
+We could search for the string `"entrypoint"`, but we have to think about forwards compatibility for a second.
+In the future, we might want to add new ways for the host and plugin to interact with each other, which will call for more API.
+While the rmeta trick wouldn't allow an outdated plugin to be used with a new host anyways, we must still ensure
+that the host can at least verify that this situation is happening, so it can gracefully reject the plugin instead of just crashing.
+
+So, let's wrap the entrypoint function in a little extendable `struct`:
+```rust
+pub type EntrypointFn = fn();
+
+pub struct Plugin {
+    pub entrypoint: EntrypointFn,
+}
+```
+
+Now a host can search for an entire `Plugin` with whatever it may contain. Let's add one very crucial bit of information to it: the *API version*.
+
+```rust
+pub type EntrypointFn = fn();
+
+#[repr(C)]
+pub struct Plugin {
+    pub version: u32,
+    pub entrypoint: EntrypointFn,
+}
+```
+
+Oh, where did that `repr(C)` come from, I thought we didn't need it? Don't worry, this is the only place where it shows up.
+The rationale is this: the host should be able to check a plugin's API version to check compatibility even if the plugin comes from a totally divergent API version.
+We can do this by ensuring that the version number is always the very first field of the struct, so that a host can cast the `Plugin` to a `u32`. 
+That way, only the version number is extracted, and nothing else about the plugin layout is assumed.
+That's what `repr(C)` is for here: ensuring the ordering of the fields stays exactly as written.
+
+The example code in this repo has some extra bells and whistles, but you should be able to understand it easily if the above made sense to you.
+
+### Exporting a plugin
+
+Now let's see how a plugin should look like. It's clear that it should export a `Plugin` struct. 
+We can do that with a `static` variable:
+
+```rust
+use api::*;
+
+#[unsafe(no_mangle)]
+pub static PLUGIN: Plugin = Plugin {
+    version: 1,
+    entrypoint,
+};
+
+fn entrypoint() {
+    // we'll get here soon
+    // ...
+}
+```
+
+The only scary bit about this is the `unsafe(no_mangle)` attribute. This essentially tells the compiler 
+to please write down the symbol name exactly as written in the code. In our case, it will be exported as `PLUGIN`.
+That's the magic string I mentioned earlier, and we will see it again in a bit when we look at how to set up the host.
+
+Now let's have a little look at how `entrypoint` has to look, because it's got a twist:
+
+```rust
+fn entrypoint() {
+    std::panic::catch_unwind(|| {
+        // your code goes here
+        println!("Hello World!");
+    })
+    .map_err(|payload| {
+        let reason = if let Some(s) =
+            payload.downcast_ref::<&'static str>()
+        {
+            (*s).to_owned()
+        } else if let Some(s) =
+            payload.downcast_ref::<String>()
+        {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_owned()
+        };
+        eprintln!("Plugin panicked: {}", reason)
+    })
+}
+```
+
+The reason why this looks a bit spooky is that when a Rust plugin panics, the host process is guaranteed to just terminate instantly.
+Usually it's nicer to print a big error message, maybe do some additional logging, some cleanup, and then
+just ignore the failing plugin and try to go on with the rest of the program. 
+And even if you *do* want to panic the host too, you still want to control that shutdown in the host itself and not just brutally tear it down from a plugin.
+
+This is why we use `catch_unwind` to not abort the plugin on panics, but to instead just print an error message and exit the entrypoint. 
+If you want to propagate this error to the host and handle it there, you can let `entrypoint` return a `Result<(), PluginError>` or similar, that part is just regular old Rust error handling.
+
+Note that unwinding requires the panic handler to be set to `unwind` in the first place, which it is by default.
+If you however distribute your api and host with `panic = "abort"`, you can disregard this advice, since there's by definition no way to stop a plugin from panicking there.
+
+A little note on the string handling: `catch_unwind` doesn't get a typed panic, but a general `Box<dyn Any + Send>`, which cannot be printed directly.
+Almost all panic payloads are some kind of string value, so we check if we can cast it to a `&str` or `String` and print that if possible.
+
+### The host process
+
+Now let's combine all that we built up. We will create a binary that 
+- loads the plugin dynamic library
+- finds the `PLUGIN` symbol
+- treats it as a `Plugin`
+- checks if the API version is compatible
+- if so: calls the plugin entrypoint
+
+The star of the show here will be the [`libloading`](https://docs.rs/libloading/latest/libloading/) crate,
+which handles all the attrocities of loading dynamic libraries across different platforms for us.
+
+```rust
+use api::*
+use libloading::{Library, Symbol};
+
+fn main() {
+    let lib = unsafe { Library::new("path/to/your/libplugin.so").context("failed to find libplugin.so")? };
+    // We loaded the library, now let's leak it. Why?
+    // Well TL;DR unloading a dylib is really really hard to do right, and honestly not really worth it.
+    let lib: &'static mut Library = Box::leak(Box::new(lib));
+    // First: validate that the plugin is API-compatible
+    {
+        // Only load the `api_version`, which is guaranteed to be
+        // the first field inside `Plugin`s across all versions of `api`.
+        let api_version: Symbol<&u32> =
+            unsafe { lib.get("PLUGIN") }.context("No PLUGIN symbol exported")?;
+        if api_version != 1 {
+            panic!(
+                "API version mismatch: expected {}, got {}",
+                1,
+                api_version
+            );
+        }
+    }
+    // Okay, it's compatile! Now let's leak it and then load the plugin from the leaked ref.
+    // Why leak? well TL;DR unloading a dylib is really really hard to do right, and honestly not really worth it.
+    let lib: &'static mut Library = Box::leak(Box::new(lib));
+
+    // *Now* we can properly use the plugin.
+    let plugin: Symbol<&Plugin> = unsafe { lib.get("PLUGIN").unwrap() };
+    (plugin.entrypoint)();
+}
+```
+
+Hopefully the comments should be more or less self-explanatory, but let's look at some select bits of code to make sure.
+
+```rust
+let lib = unsafe { Library::new("path/to/your/libplugin.so").context("failed to find libplugin.so")? };
+```
+Here we load the `plugin` library. `libplugin.so` is the naming convention on Linux, 
+so you will want to adapt this name for the platform you are targeting. E.g. on Windows, you would be looking for `plugin.dll` instead.
+Instead of searching for a single specific plugin, you would probably also want to loop through all plugins in a 
+well-known directory such as `plugins/` or `mods/`, so that users can drag new plugins in that directory on their own.
+And finally, you'd want to not panic if the plugin is not found of course, but that goes for all instances of
+`.expect` and `panic!` in this example. Error handling is important! But let's not get bogged down in that for this showcase.
 
 
+```rust
+let api_version: Symbol<&u32> =
+            unsafe { lib.get("PLUGIN") }.context("No PLUGIN symbol exported")?;
+```
+This line searches for the plugin we exported earlier under the name `PLUGIN`, and loads it as a `u32`.
+We can do that because we have guaranteed that the first field in the `Plugin` will always be a version number.
+In a real host, you'd probably use some kind of semver scheme instead of just a single `u32`, 
+but you get the idea. Just make sure that bit, which is usually called the *plugin header*, 
+is `repr(C)` so that incompatible hosts can at least inspect it.
 
-TODO:
-- panic unwind in plugin
-  - don't panic in api
-- API version check
-- entrypoint needs to be `repr(C)`
-- `#[unsafe(no_mangle)]`
-- this works when distributing release
-- this works when using different rustflags (with a few rare exceptions)
-- `rust-toolchain.toml`
+Assuming that the `api_version` is correct, we can now actually use the plugin.
+But before, let's commit a memory leak on purpose!
+
+```rust
+let lib: &'static mut Library = Box::leak(Box::new(lib));
+```
+
+Eek, why would we do that?! Well, `libloading` has one mechanism that is a bit controversial: dropping the
+`Library` variable will automatically unload the dynamic library. That *sounds* great, but remember that
+the `plugin` is allowed to allocate and store memory freely. This memory will be freed, but not zeroed on an unload.
+That means that if the `plugin` allocates a `Bunny` and passes it onto `api` for storage, then gets unloaded,
+the `api` will now be holding an undead zombie `Bunny` that is pointing to invalid memory.
+There's a ton of rather obscure ways in which similar things happen when unloading, leading to a zoo of
+undefined behavior. As such, unloading a dynamic library is really really hard in practice, so it's common
+to just leak it to avoid the hassle. Yes, that is a memory leak, but in most plugin systems, you will never 
+load, unload, load, unload, load, unload a ton of plugins at runtime anyways. 
+Usually it's just a check at startup, and once a plugin is loaded, there's little reason to unload it other than it crashing.
+
+```rust
+let plugin: Symbol<&Plugin> = unsafe { lib.get("PLUGIN") }.unwrap();
+(plugin.entrypoint)();
+```
+
+We load the full `Plugin` now and finally call its entrypoint. 
+At this point, you could also pass parameters to `entrypoint`, or check for a return value. As mentioned before,
+this is a great time to check if any internal errors made the plugin panic and return a `Result` that communicates this fact.
+
+
+Now that we have the full code, there is one annoying last thing we need to do. See, when we told Rust to use the dynamically linked standard library,
+it will not automatically put that standard library into the right place to actually load it. Silly, I know.
+You can manually find it on your machine and place it next to the `host` executable, 
+but [`prefer-dynamic`](https://github.com/WilliamVenner/prefer-dynamic/) does that job for you.
+Simply add it to your dependencies and it will move things where they need to be.
+
 
 ## Caveats
 
 TODO:
 - maybe r-a overrides stuff
-- get libstd.so into the right dir
-- leak libloading instead of dropping
+- `rust-toolchain.toml`
 - allocator
 - platform
 - target-feature / simd
