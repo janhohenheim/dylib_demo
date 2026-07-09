@@ -280,6 +280,11 @@ This way, you can change internal calls to `--extern api=...` to point to our `.
 The user's call then becomes a trivial `RUSTC_WRAPPER="my_cool_wrapper" cargo build`. 
 The code for doing this is left as an exercise to the reader ;)
 
+Anyways, if you *don't* have a `RUSTC_WRAPPER`, you should be aware that calling `rustc` like shown above completely
+bypasses the `Cargo.toml` you are used to. You probably still want to keep a `Cargo.toml` around so rust-analyzer
+doesn't get too sad. That will however also lead to r-a running `cargo check` without our custom linking step,
+potentially producing invalid artifacts along the way. I never ran into problems with this, but YMMV.
+
 ## Determinism as a consequence
 
 As hinted at before, there's one more thing to dynamic linking interop than types: calling conventions.
@@ -365,6 +370,26 @@ Treat the following as a non-exhaustive list, since I bet there are some I don't
 - `-C panic`: changes the panic strategy. For the standard library, the default is `unwind`, but you can set it to `abort` to make panics non-recoverable.
   If you build for `no_std`, you will need to specify your own panic handler.
   Regardless, `api`/`host` and `plugin` need to agree on the panic strategy used.
+
+## Other gotchas
+
+`api` / `host` and `plugin` also need to agree on the compiler version and target triple used. 
+The target triple is solved by the fact that you need to distribute individual dynamic libraries for each target platform anyways.
+For the compiler version, a good way to ensure agreement is to distribute a `rust-toolchain.toml` pointing to a compiler version you like.
+I personally always build on `nightly` because it's much faster than on `stable` (see [my config](https://gist.github.com/janhohenheim/5731c11e91736bab5e9ef58c2a982c36)), 
+so my `rust-toolchain.toml` looks like this:
+```toml
+[toolchain]
+channel = "nightly-2026-06-21"
+```
+
+All packages must also agree on the allocator used, so `plugin`s are not allowed to use `#[global_allocator]` to change it away from the default.
+If you want to use a custom allocator across `api`/`host` and `plugin`, I'm sure there's a way to do it, but
+I confess I'm not very into allocators, so I don't have any advice here. All I know is that the `rmeta` trick
+works with the default allocator.
+
+A very similar story with `#[target_feature]`-based SIMD support. Be aware that `plugin`s shouldn't just enable
+these without agreeing with the `api`/`host` beforehand, but I don't have any great insights here either.
 
 ## Some words on plugin systems in general
 
@@ -581,13 +606,3 @@ it will not automatically put that standard library into the right place to actu
 You can manually find it on your machine and place it next to the `host` executable, 
 but [`prefer-dynamic`](https://github.com/WilliamVenner/prefer-dynamic/) does that job for you.
 Simply add it to your dependencies and it will move things where they need to be.
-
-
-## Caveats
-
-TODO:
-- maybe r-a overrides stuff
-- `rust-toolchain.toml`
-- allocator
-- platform
-- target-feature / simd
